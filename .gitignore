@@ -1,0 +1,5 @@
+.DS_Store
+*.log
+*.pid
+.nginx-credentials
+ttyd-index.html

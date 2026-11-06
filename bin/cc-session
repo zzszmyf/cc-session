@@ -1,0 +1,350 @@
+#!/usr/bin/env bash
+# cc-session — 在 tmux 里跑交互式 Claude Code，随时 attach 观察/参与。
+#
+# 用法：
+#   cc-session start <name> "<prompt>" [workdir]
+#   cc-session attach <name>          # 进入会话（Ctrl-b d 退出但任务继续）
+#   cc-session ls                     # 列出所有 cc-* 会话
+#   cc-session logs <name>            # 跟踪原始终端日志（含 ANSI 控制符）
+#   cc-session send <name> <text...>  # 不 attach 也能给 Claude 发一句话
+#   cc-session web <name> [port]      # 起 ttyd 网页终端（默认 127.0.0.1:7681）
+#   cc-session web-nginx <name> [port] # 走 nginx 子路径（默认 /cc/，绑定 127.0.0.1）
+#   cc-session hub [port]             # 持久 Hub：/cc/ 常开，进去选/建会话
+#   cc-session hub-stop               # 关掉 Hub
+#   cc-session web-stop <name>        # 关掉该会话的网页终端
+#   cc-session stop <name>            # 结束会话
+#
+# 默认行为：
+#   - 模型：不显式传 --model，沿用 ~/.zshrc 里的 ANTHROPIC_MODEL（DeepSeek）
+#   - 权限：--permission-mode auto（自动模式，自动接收编辑）
+#   - 环境：启动前 source ~/.zshrc（模型/网关/effort 等配置）
+#
+# 可用环境变量覆盖：
+#   CC_PERMISSION_MODE   默认 auto；可改 acceptEdits / manual / bypassPermissions
+#   CC_MODEL             传了才加 --model（默认继承 ~/.zshrc）
+#   CC_EXTRA_ARGS        追加给 claude 的参数（原样按空格拆分）
+#   CC_DRY_RUN=1         只生成启动文件，不创建 tmux 会话
+#   CC_WEB_BIND          ttyd 监听地址，默认 127.0.0.1（公网暴露请设 0.0.0.0 并配密码）
+#   CC_WEB_PORT          ttyd 端口，默认 7681
+#   CC_WEB_BASE_PATH     ttyd 子路径（配合 nginx location /cc/ 时设 /cc/）
+#   CC_WEB_AUTH=off      关闭 ttyd 自带 Basic Auth（仅限绑定私有地址 + nginx 鉴权时）
+#   CC_WEB_USER/CC_WEB_PASSWORD  网页终端 Basic Auth；绑定非 127.0.0.1 时自动生成密码
+
+set -euo pipefail
+
+SESS_PREFIX="cc-"
+BASE_DIR="${CC_SESSION_HOME:-${HOME}/.cc-sessions}"
+ZSHRC="${CC_SESSION_ZSHRC:-${HOME}/.zshrc}"
+CLAUDE_BIN="${CLAUDE_BIN:-${HOME}/.local/bin/claude}"
+
+die() { echo "cc-session: $*" >&2; exit 1; }
+usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; }
+
+validate_name() {
+  [[ "$1" =~ ^[A-Za-z0-9_-]+$ ]] || die "会话名只能包含字母、数字、下划线和短横线：$1"
+}
+
+session_name() { echo "${SESS_PREFIX}$1"; }
+
+session_exists() { tmux has-session -t "$(session_name "$1")" 2>/dev/null; }
+
+cmd_start() {
+  local name="${1:-}" prompt="${2:-}" workdir="${3:-$PWD}"
+  [[ -n "$name" && -n "$prompt" ]] || die '用法: cc-session start <name> "<prompt>" [workdir]'
+  validate_name "$name"
+  [[ -d "$workdir" ]] || die "工作目录不存在: $workdir"
+  command -v tmux >/dev/null || die "未安装 tmux"
+
+  local sess; sess="$(session_name "$name")"
+  if session_exists "$name"; then
+    die "会话已存在: $sess（用 cc-session attach $name 进入，或先 stop）"
+  fi
+
+  local dir="${BASE_DIR}/${name}"
+  mkdir -p "$dir"
+  printf '%s' "$prompt" > "${dir}/prompt.txt"
+
+  # 启动脚本：source zshrc（bash 也能吃这些 export），再进入交互式 Claude。
+  # Claude 退出后留在 bash，方便 claude --continue 接着聊。
+  cat > "${dir}/launch.sh" <<'LAUNCH'
+#!/usr/bin/env bash
+set -o pipefail
+export PATH="$HOME/.local/bin:$PATH"
+if [ -f "$HOME/.zshrc" ]; then
+  set -a
+  # shellcheck disable=SC1090
+  . "$HOME/.zshrc"
+  set +a
+fi
+
+PROMPT="$(cat "$PROMPT_FILE")"
+ARGS=(--permission-mode "${CC_PERMISSION_MODE:-auto}")
+[ -n "${CC_MODEL:-}" ] && ARGS+=(--model "$CC_MODEL")
+# shellcheck disable=SC2206
+[ -n "${CC_EXTRA_ARGS:-}" ] && ARGS+=(${CC_EXTRA_ARGS})
+
+echo "[cc-session] dir=$PWD mode=${CC_PERMISSION_MODE:-auto} model=${CC_MODEL:-<from ~/.zshrc>}"
+"$CLAUDE_BIN" "${ARGS[@]}" "$PROMPT"
+code=$?
+echo
+echo "[cc-session] claude exited with code $code"
+echo "[cc-session] 可执行 claude --continue 继续；或 Ctrl-b d 退出 tmux（会话保留）"
+exec bash -i
+LAUNCH
+  chmod +x "${dir}/launch.sh"
+
+  if [[ "${CC_DRY_RUN:-0}" == "1" ]]; then
+    echo "[dry-run] 启动脚本: ${dir}/launch.sh"
+    echo "[dry-run] prompt: ${dir}/prompt.txt"
+    echo "[dry-run] workdir: ${workdir}"
+    return 0
+  fi
+
+  tmux new-session -d -s "$sess" -c "$workdir" \
+    "PROMPT_FILE='${dir}/prompt.txt' CLAUDE_BIN='${CLAUDE_BIN}' CC_MODEL='${CC_MODEL:-}' CC_PERMISSION_MODE='${CC_PERMISSION_MODE:-auto}' CC_EXTRA_ARGS='${CC_EXTRA_ARGS:-}' '${dir}/launch.sh'"
+
+  # 原始终端日志（含 ANSI 控制符，便于事后翻看）
+  tmux pipe-pane -t "$sess" -o "cat >> '${dir}/session.log'"
+
+  echo "✅ 已启动: $sess"
+  echo "   工作目录: $workdir"
+  echo "   进入观察/参与: cc-session attach $name"
+  echo "   不进入发消息:   cc-session send $name \"...\""
+  echo "   日志:           cc-session logs $name"
+}
+
+cmd_attach() {
+  local name="${1:-}"; [[ -n "$name" ]] || die '用法: cc-session attach <name>'
+  validate_name "$name"
+  session_exists "$name" || die "会话不存在: $(session_name "$name")"
+  exec tmux attach -t "$(session_name "$name")"
+}
+
+cmd_ls() {
+  local out
+  out="$(tmux list-sessions -F '#{session_name}|#{?session_attached,attached,detached}|#{session_created_string}' 2>/dev/null | grep "^${SESS_PREFIX}" || true)"
+  if [[ -z "$out" ]]; then
+    echo "没有 cc-session 会话"
+    return 0
+  fi
+  printf '%-28s %-10s %s\n' "SESSION" "STATUS" "CREATED"
+  while IFS='|' read -r s status created; do
+    printf '%-28s %-10s %s\n' "$s" "$status" "$created"
+  done <<< "$out"
+}
+
+cmd_logs() {
+  local name="${1:-}"; [[ -n "$name" ]] || die '用法: cc-session logs <name>'
+  validate_name "$name"
+  local log="${BASE_DIR}/${name}/session.log"
+  [[ -f "$log" ]] || die "日志不存在: $log"
+  exec tail -n 200 -f "$log"
+}
+
+cmd_send() {
+  local name="${1:-}"; shift || true
+  local text="$*"
+  [[ -n "$name" && -n "$text" ]] || die '用法: cc-session send <name> <text...>'
+  validate_name "$name"
+  session_exists "$name" || die "会话不存在: $(session_name "$name")"
+  tmux send-keys -t "$(session_name "$name")" -l -- "$text"
+  tmux send-keys -t "$(session_name "$name")" Enter
+  echo "→ 已发送到 $(session_name "$name"): $text"
+}
+
+cmd_web() {
+  local name="${1:-}" port="${2:-${CC_WEB_PORT:-7681}}"
+  [[ -n "$name" ]] || die '用法: cc-session web <name> [port]'
+  validate_name "$name"
+  session_exists "$name" || die "会话不存在: $(session_name "$name")"
+  command -v ttyd >/dev/null || die "未安装 ttyd：curl -L -o ~/.local/bin/ttyd https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 && chmod +x ~/.local/bin/ttyd"
+
+  local dir="${BASE_DIR}/${name}"
+  local pidfile="${dir}/ttyd.pid"
+  if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+    die "网页终端已在运行 (pid $(cat "$pidfile"))；先 cc-session web-stop $name"
+  fi
+  if ss -ltn 2>/dev/null | grep -qE "[:.]${port}[[:space:]]"; then
+    die "端口 ${port} 已被占用，换一个空闲端口（如 7681）。注意 81 是 nginx 反代，停掉会带走全部站点。"
+  fi
+
+  local bind="${CC_WEB_BIND:-127.0.0.1}"
+  local user="${CC_WEB_USER:-cc}"
+  local pass="${CC_WEB_PASSWORD:-}"
+  # 绑到公网时必须带密码，没给就生成一个；CC_WEB_AUTH=off 时交给 nginx 鉴权
+  if [[ "${CC_WEB_AUTH:-on}" != "off" && -z "$pass" && "$bind" != "127.0.0.1" && "$bind" != "localhost" ]]; then
+    pass="$(head -c 24 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)"
+  fi
+
+  local args=(-p "$port" -i "$bind" -W)
+  # 自定义 index：iOS Safari 软键盘修复（helper textarea + 键盘按钮）
+  [[ -f "${BASE_DIR}/ttyd-index.html" ]] && args+=(-I "${BASE_DIR}/ttyd-index.html")
+  [[ -n "${CC_WEB_BASE_PATH:-}" ]] && args+=(-b "${CC_WEB_BASE_PATH}")
+  [[ -n "$pass" ]] && args+=(-c "${user}:${pass}")
+
+  # setsid：脱离当前进程组，避免 bridge/父 shell 退出时被一起回收。
+  setsid bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$pidfile" \
+    ttyd "${args[@]}" tmux attach -t "$(session_name "$name")" \
+    >"${dir}/ttyd.log" 2>&1 </dev/null &
+  sleep 1
+  if ! kill -0 "$(cat "$pidfile")" 2>/dev/null; then
+    rm -f "$pidfile"
+    die "ttyd 启动失败：$(tail -5 "${dir}/ttyd.log")"
+  fi
+
+  echo "✅ 网页终端已启动: $(session_name "$name") (pid $(cat "$pidfile"))"
+  if [[ "${CC_WEB_BASE_PATH:-}" == "/cc/" ]]; then
+    echo "   地址: http://<server>:${CC_PUBLIC_PORT:-81}${CC_WEB_BASE_PATH:-/cc/}  (nginx 子路径)"
+    echo "   账号: $(grep '^user:' "${BASE_DIR}/.nginx-credentials" 2>/dev/null | awk '{print $2}' || echo cc)"
+    echo "   密码见: ${BASE_DIR}/.nginx-credentials"
+  elif [[ "$bind" == "127.0.0.1" || "$bind" == "localhost" ]]; then
+    echo "   地址: http://${bind}:${port}"
+    echo "   本机访问（SSH 隧道）: ssh -L ${port}:127.0.0.1:${port} $(whoami)@<server>"
+  else
+    local ip; ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    echo "   地址: http://${ip:-<server>}:${port}"
+    [[ -n "$pass" ]] && echo "   账号: ${user}  密码: ${pass}"
+  fi
+  echo "   停止: cc-session web-stop $name"
+}
+
+cmd_web_nginx() {
+  local name="${1:-}" port="${2:-7681}"
+  export CC_WEB_BIND="${CC_WEB_BIND:-127.0.0.1}"
+  export CC_WEB_BASE_PATH="${CC_WEB_BASE_PATH:-/cc/}"
+  export CC_WEB_AUTH="${CC_WEB_AUTH:-off}"
+  cmd_web "$name" "$port"
+}
+
+# ---- 持久 Hub：/cc/ 永远可用，进去后选会话 ----
+
+cmd_picker() {
+  trap 'echo; exit 0' INT TERM
+  while true; do
+    clear 2>/dev/null || true
+    echo "=============================================="
+    echo "  cc-session 会话"
+    echo "=============================================="
+    local sessions
+    sessions="$(tmux list-sessions -F '#{session_name}|#{?session_attached,attached,detached}' 2>/dev/null | grep "^${SESS_PREFIX}" || true)"
+    if [[ -z "$sessions" ]]; then
+      echo "  （还没有会话）"
+    else
+      while IFS='|' read -r s status; do
+        printf '  %-24s %s\n' "$s" "$status"
+      done <<< "$sessions"
+    fi
+    echo
+    echo "  输入会话名进入；输入 new 新建；q 退出"
+    read -rp "> " choice || exit 0
+    case "$choice" in
+      q|Q|quit|exit) exit 0 ;;
+      new|N|n)
+        read -rp "会话名: " name
+        [[ "$name" =~ ^[A-Za-z0-9_-]+$ ]] || { echo "名称只能包含字母、数字、_ 和 -"; sleep 1; continue; }
+        read -rp "工作目录 [$HOME]: " workdir
+        workdir="${workdir:-$HOME}"
+        read -rp "给 Claude 的初始 prompt: " prompt
+        [[ -n "$prompt" ]] || { echo "prompt 不能为空"; sleep 1; continue; }
+        if "$0" start "$name" "$prompt" "$workdir"; then
+          sleep 1
+          tmux attach -t "${SESS_PREFIX}${name}"
+        fi
+        ;;
+      "")
+        continue
+        ;;
+      *)
+        if tmux has-session -t "${SESS_PREFIX}${choice}" 2>/dev/null; then
+          tmux attach -t "${SESS_PREFIX}${choice}"
+        else
+          echo "没有这个会话: ${SESS_PREFIX}${choice}"
+          sleep 1
+        fi
+        ;;
+    esac
+  done
+}
+
+cmd_hub() {
+  local port="${1:-7681}" dir="${BASE_DIR}"
+  command -v ttyd >/dev/null || die "未安装 ttyd"
+  local pidfile="${dir}/.hub.pid"
+  if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+    echo "Hub 已在运行 (pid $(cat "$pidfile")): http://<server>:81/cc/"
+    return 0
+  fi
+  if ss -ltn 2>/dev/null | grep -qE "[:.]${port}[[:space:]]"; then
+    die "端口 ${port} 已被占用；先 cc-session hub-stop"
+  fi
+  mkdir -p "$dir"
+  local index_args=()
+  [[ -f "${dir}/ttyd-index.html" ]] && index_args=(-I "${dir}/ttyd-index.html")
+  # setsid：脱离当前进程组，bridge/父 shell 退出后 Hub 仍常驻。
+  setsid bash -c 'echo $$ > "$1"; shift; exec "$@"' _ "$pidfile" \
+    ttyd -p "$port" -i "${CC_HUB_BIND:-127.0.0.1}" -b "${CC_WEB_BASE_PATH:-/cc/}" -W "${index_args[@]}" "$0" picker \
+    >"${dir}/hub.log" 2>&1 </dev/null &
+  sleep 1
+  kill -0 "$(cat "$pidfile")" 2>/dev/null || { rm -f "$pidfile"; die "Hub 启动失败: $(tail -5 "${dir}/hub.log")"; }
+  echo "✅ cc-session Hub 已启动 (pid $(cat "$pidfile"))"
+  echo "   地址: http://<server>:81/cc/  (Basic Auth)"
+  echo "   账号: $(grep '^user:' "${dir}/.nginx-credentials" 2>/dev/null | awk '{print $2}' || echo cc)"
+  echo "   密码见: ${dir}/.nginx-credentials"
+}
+
+cmd_hub_stop() {
+  local pidfile="${BASE_DIR}/.hub.pid"
+  if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+    kill "$(cat "$pidfile")" 2>/dev/null || true
+    rm -f "$pidfile"
+    echo "已停止 cc-session Hub"
+  else
+    rm -f "$pidfile"
+    echo "Hub 未运行"
+  fi
+}
+
+cmd_web_stop() {
+  local name="${1:-}"; [[ -n "$name" ]] || die '用法: cc-session web-stop <name>'
+  validate_name "$name"
+  local pidfile="${BASE_DIR}/${name}/ttyd.pid"
+  if [[ -f "$pidfile" ]] && kill -0 "$(cat "$pidfile" 2>/dev/null)" 2>/dev/null; then
+    kill "$(cat "$pidfile")" 2>/dev/null || true
+    rm -f "$pidfile"
+    echo "已停止网页终端: $(session_name "$name")"
+  else
+    rm -f "$pidfile"
+    echo "网页终端未运行: $(session_name "$name")"
+  fi
+}
+
+cmd_stop() {
+  local name="${1:-}"; [[ -n "$name" ]] || die '用法: cc-session stop <name>'
+  validate_name "$name"
+  session_exists "$name" || die "会话不存在: $(session_name "$name")"
+  cmd_web_stop "$name" >/dev/null 2>&1 || true
+  tmux kill-session -t "$(session_name "$name")"
+  echo "已结束: $(session_name "$name")（日志保留在 ${BASE_DIR}/${name}/）"
+}
+
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    start)  cmd_start "$@" ;;
+    attach|a) cmd_attach "$@" ;;
+    ls|list) cmd_ls ;;
+    logs|log) cmd_logs "$@" ;;
+    send|s) cmd_send "$@" ;;
+    web) cmd_web "$@" ;;
+    web-nginx) cmd_web_nginx "$@" ;;
+    web-stop|webstop) cmd_web_stop "$@" ;;
+    hub) cmd_hub "$@" ;;
+    hub-stop|hubstop) cmd_hub_stop ;;
+    picker) cmd_picker ;;
+    stop|kill) cmd_stop "$@" ;;
+    help|-h|--help) usage ;;
+    *) die "未知命令: $cmd（cc-session help）" ;;
+  esac
+}
+
+main "$@"
