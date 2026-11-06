@@ -1,5 +1,10 @@
 # cc-session
 
+[![CI](https://github.com/zzszmyf/cc-session/actions/workflows/ci.yml/badge.svg)](https://github.com/zzszmyf/cc-session/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/zzszmyf/cc-session?display_name=tag)](https://github.com/zzszmyf/cc-session/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey)]()
+
 Run interactive Claude Code sessions inside tmux, attach from anywhere, and optionally expose a browser terminal.
 
 `cc-session` is a small shell wrapper around `tmux` (and optionally `ttyd`) for long-running coding agents. It keeps the agent alive when your SSH connection drops, lets you send a message without attaching, and gives you a browser UI when you are on a phone.
@@ -13,6 +18,12 @@ Run interactive Claude Code sessions inside tmux, attach from anywhere, and opti
 - Optional web terminal via `ttyd`
 - Multi-session hub with a picker
 - Mobile-friendly notes, including the iOS Safari keyboard workaround
+
+## Demo
+
+![cc-session demo](docs/demo.gif)
+
+Animated terminal rendering of the basic flow: start a session, send a prompt without attaching, then list sessions. Static frame: [`docs/demo.png`](docs/demo.png).
 
 ## Requirements
 
