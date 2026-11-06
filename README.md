@@ -125,6 +125,10 @@ cc-session stop 任务名
 
 适合：长任务怕 SSH 断、想在手机上查看进度、需要多个 agent 会话并行。
 
+## Related
+
+Part of [feishu-agent-stack](https://github.com/zzszmyf/feishu-agent-stack) — tools for running coding agents from Feishu/Lark. See also [`feishu-agent-scheduler`](https://github.com/zzszmyf/feishu-agent-scheduler) for cron-style agent jobs and [`pi-managed-agents`](https://github.com/zzszmyf/pi-managed-agents) for managed sessions and sandboxes.
+
 ## License
 
 MIT
